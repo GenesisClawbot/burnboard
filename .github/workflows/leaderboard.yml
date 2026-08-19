@@ -1,0 +1,40 @@
+name: leaderboard
+
+on:
+  issues:
+    types: [opened, edited, reopened, closed, deleted]
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: read
+
+concurrency:
+  group: leaderboard
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build the board from public issues
+        run: node scripts/build-leaderboard.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Commit if the board changed
+        run: |
+          if git diff --quiet -- docs; then
+            echo "board unchanged"
+            exit 0
+          fi
+          git config user.name "burnboard-build"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs
+          git commit -m "board: rebuild from issues"
+          git push

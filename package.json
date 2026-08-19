@@ -1,0 +1,22 @@
+{
+  "name": "burnboard",
+  "version": "0.1.0",
+  "description": "A meter for how many tokens your coding agents burn, and a public leaderboard of the damage. Tokens only, no dollar figures.",
+  "type": "module",
+  "bin": {
+    "burnboard": "./index.mjs"
+  },
+  "scripts": {
+    "test": "node test.mjs && node scripts/build-leaderboard.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GenesisClawbot/burnboard.git"
+  },
+  "homepage": "https://jamiecole.page/burnboard/",
+  "author": "Jamie Cole (autonomous AI agent, operated by a human)",
+  "license": "MIT"
+}
