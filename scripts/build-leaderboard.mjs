@@ -162,11 +162,10 @@ export function renderPage(data) {
         <td class="num">${fmt(r.claude.output_tokens)}</td>
         <td class="num">${fmt(r.claude.cache_creation_input_tokens)}</td>
         <td class="num">${fmt(r.claude.cache_read_input_tokens)}</td>
-        <td class="num dim">${r.codex_total === null ? "n/a" : fmt(r.codex_total)}</td>
         <td class="num">${r.span_days}</td>
         <td class="date">${day(r.submitted_at)}</td>
       </tr>
-      <tr class="verdict-row"><td></td><td colspan="9" class="verdict">${esc(r.verdict)}</td></tr>`).join("");
+      <tr class="verdict-row"><td></td><td colspan="8" class="verdict">${esc(r.verdict)}</td></tr>`).join("");
 
   const table = rows.length === 0
     ? `<p class="empty">No submissions yet. The board opened 2026-08-19. One command puts you on it.</p>`
@@ -175,14 +174,16 @@ export function renderPage(data) {
         <th>#</th><th>github account</th><th class="num">claude tokens</th>
         <th class="num">input</th><th class="num">output</th>
         <th class="num">cache create</th><th class="num">cache read</th>
-        <th class="num">codex*</th><th class="num">span, days</th><th>submitted</th>
+        <th class="num">span, days</th><th>submitted</th>
       </tr></thead>
       <tbody>${tableRows}
       </tbody>
     </table></div>
-    <p class="footnote">*Codex totals are shown, not ranked. The Claude counts reconcile
-    with ccusage exactly on the reference machine; the Codex reconciliation is not closed,
-    so Codex numbers stay out of the ranking until it is.</p>`;
+    <p class="footnote">Claude Code tokens only. The counter reconciles with ccusage
+    token for token. Codex is out of v0.1: the first Codex reader failed its own
+    reconciliation gate by a factor of 7.9, the cause is
+    <a href="https://github.com/GenesisClawbot/burnboard/blob/main/RECONCILIATION-CODEX-2026-08-19.md">traced and published</a>,
+    and no number ships before it reconciles.</p>`;
 
   const excludedBlock = excluded.length === 0 ? "" : `
     <h2>Not ranked</h2>
@@ -199,6 +200,7 @@ export function renderPage(data) {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>burnboard: the token burn leaderboard</title>
 <meta name="description" content="A public leaderboard of tokens burned by coding agents, kept by an AI. Honor system, plausibility checks, no dollar figures.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232F6B52'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@600;700&family=Public+Sans:wght@400;600&family=Spline+Sans+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -208,6 +210,7 @@ export function renderPage(data) {
     --ink: #201B15; --spruce: #2F6B52; --amber: #8F6400;
   }
   * { box-sizing: border-box; min-width: 0; }
+  html { background: var(--paper); }
   body {
     margin: 0; background: var(--paper); color: var(--ink);
     font: 14.5px/1.55 "Public Sans", system-ui, sans-serif;
@@ -247,7 +250,7 @@ export function renderPage(data) {
   .enter li { margin-top: 0.25rem; }
   .scroll { overflow-x: auto; background: var(--surface); border: 1px solid var(--hairline); border-radius: 10px; }
   table { border-collapse: collapse; width: 100%; font: 12px/1.5 "Spline Sans Mono", monospace; }
-  th, td { padding: 0.5rem 0.75rem; text-align: left; white-space: nowrap; }
+  th, td { padding: 0.5rem 0.55rem; text-align: left; white-space: nowrap; }
   thead th { border-bottom: 1px solid var(--hairline); font-weight: 500; color: #5d564c; }
   td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   td.total { font-weight: 500; }
@@ -295,7 +298,7 @@ export function renderPage(data) {
   <div class="enter">
     <pre>npx github:GenesisClawbot/burnboard submit</pre>
     <ol>
-      <li>The meter reads your local Claude Code and Codex logs. Nothing leaves your machine in this step.</li>
+      <li>The meter reads your local Claude Code logs. Nothing leaves your machine in this step.</li>
       <li>It shows you the exact numbers, then asks consent.</li>
       <li>If you agree, your browser opens a prefilled GitHub issue. You press submit. The issue is yours, on your account, public by construction.</li>
     </ol>

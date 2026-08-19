@@ -407,17 +407,16 @@ test("combinedTotal sums the four claude buckets plus the codex total", () => {
   assert.equal(combinedTotal(fixtureReport()), 100 + 200 + 300 + 400 + 70);
 });
 
-test("buildSubmission carries totals, spans and counts, nothing else", () => {
+test("buildSubmission carries claude totals, span and counts, and no codex", () => {
   const sub = buildSubmission(fixtureReport());
   assert.equal(sub.burnboard, 1);
   assert.equal(sub.claude.input_tokens, 100);
   assert.equal(sub.claude.cache_read_input_tokens, 400);
   assert.equal(sub.claude.entries, 5);
   assert.equal(sub.claude.first_ts, "2026-08-01T00:00:00.000Z");
-  assert.equal(sub.codex.total_tokens, 70);
-  assert.equal(sub.codex.sessions, 2);
   assert.equal(sub.claude.models, undefined);
-  assert.equal(sub.codex.windows, undefined);
+  // Codex failed its reconciliation gate; nothing of it may leave the machine.
+  assert.equal(sub.codex, undefined);
 });
 
 test("submissionIssueUrl targets the board repo with title and body", () => {

@@ -506,34 +506,11 @@ export function renderText(report) {
   lines.push("");
 
   lines.push("codex");
-  const x = report.codex;
-  if (x.sessions === 0) {
-    lines.push("  no usage entries found");
-  } else {
-    const t = x.totals;
-    const rows = [
-      ["  input", fmt(t.input_tokens)],
-      ["  cached input", fmt(t.cached_input_tokens)],
-      ["  output", fmt(t.output_tokens)],
-      ["  reasoning output", fmt(t.reasoning_output_tokens)],
-      ["  total", fmt(t.total_tokens)],
-    ];
-    lines.push(renderTable(rows));
-    lines.push(`  sessions: ${fmt(x.sessions)}  files: ${fmt(x.files)}`);
-    const windowKeys = Object.keys(x.windows);
-    if (windowKeys.length > 0) {
-      const wrows = [["  window", "used", "tokens in window"]];
-      for (const key of windowKeys) {
-        const w = x.windows[key];
-        wrows.push([
-          `  ${w.window_minutes} min`,
-          w.used_percent === null ? "n/a" : `${w.used_percent}%`,
-          fmt(w.tokens_in_window),
-        ]);
-      }
-      lines.push(renderTable(wrows));
-    }
-  }
+  lines.push("  not counted in v0.1. the first codex reader failed reconciliation");
+  lines.push("  against ccusage by a factor of 7.9: codex replays parent history");
+  lines.push("  into forked session files and the reader counted it again. the");
+  lines.push("  cause is traced and the fix is specified in RECONCILIATION-CODEX.");
+  lines.push("  no number ships before it reconciles.");
   lines.push("");
   lines.push("tokens only; this machine only");
   return lines.join("\n");
@@ -545,7 +522,7 @@ export function renderText(report) {
 
 export const BOARD_REPO = "GenesisClawbot/burnboard";
 
-const USAGE = `usage: burnboard [submit] [--json] [--since YYYY-MM-DD] [--claude-dir <path>] [--codex-dir <path>]
+const USAGE = `usage: burnboard [submit] [--json] [--since YYYY-MM-DD] [--claude-dir <path>]
 
   (no command)  print token usage on this machine
   submit        print usage, then open a prefilled GitHub issue for the
@@ -581,10 +558,13 @@ export function parseArgs(argv) {
   return { opts };
 }
 
-/** The exact numbers that go on the board. Nothing else leaves the machine. */
+/**
+ * The exact numbers that go on the board. Nothing else leaves the machine.
+ * Claude only: the Codex reader failed its reconciliation gate and no
+ * Codex number ships before it passes. See RECONCILIATION-CODEX-2026-08-19.md.
+ */
 export function buildSubmission(report) {
   const c = report.claude;
-  const x = report.codex;
   return {
     burnboard: 1,
     generated_at: report.generated_at,
@@ -595,13 +575,6 @@ export function buildSubmission(report) {
       files: c.files,
       first_ts: c.first_ts,
       last_ts: c.last_ts,
-    },
-    codex: {
-      total_tokens: x.totals.total_tokens,
-      sessions: x.sessions,
-      files: x.files,
-      first_ts: x.first_ts,
-      last_ts: x.last_ts,
     },
   };
 }
@@ -694,11 +667,13 @@ async function main() {
     return;
   }
   const { opts } = parsed;
+  // Codex is not read in v0.1: the reader failed its reconciliation gate
+  // (7.9x over on the reference machine, fork-replay re-counting). The
+  // parser stays in this file; it returns when a re-run passes the gate.
   const report = {
     generated_at: new Date().toISOString(),
     since: opts.since,
     claude: await readClaude(opts.claudeDir, { sinceMs: opts.sinceMs }),
-    codex: await readCodex(opts.codexDir, { sinceMs: opts.sinceMs }),
   };
   if (opts.submit) await runSubmit(report);
   else if (opts.json) console.log(JSON.stringify(report, null, 2));

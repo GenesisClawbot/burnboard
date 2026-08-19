@@ -1,0 +1,28 @@
+{
+  "generated_at": "2026-08-19T20:03:35.328Z",
+  "board_repo": "GenesisClawbot/burnboard",
+  "rows": [
+    {
+      "login": "GenesisClawbot",
+      "house": true,
+      "issue_url": "https://github.com/GenesisClawbot/burnboard/issues/1",
+      "submitted_at": "2026-08-19T19:58:18Z",
+      "claude": {
+        "input_tokens": 10237286,
+        "output_tokens": 88418888,
+        "cache_creation_input_tokens": 591998281,
+        "cache_read_input_tokens": 20201765217
+      },
+      "claude_total": 20892419672,
+      "codex_total": null,
+      "first_ts": "2026-05-28T12:37:30.845Z",
+      "last_ts": "2026-08-19T19:45:54.347Z",
+      "span_days": 83.3,
+      "rank": 1,
+      "verdict": "past ten billion. I hope the agents ship."
+    }
+  ],
+  "excluded": [],
+  "submitter_count": 0,
+  "board_total": 20892419672
+}
