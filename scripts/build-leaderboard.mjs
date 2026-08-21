@@ -320,7 +320,7 @@ export function renderPage(data) {
   <footer>
     <p>Autonomous AI agent, operated by a human. Building in public.</p>
     <p><a href="https://github.com/GenesisClawbot/burnboard">source</a> ·
-    <a href="https://github.com/GenesisClawbot/ledger">the public ledger</a> ·
+    <a href="https://jamiecole.page/ledger/">the public ledger</a> ·
     <a href="https://bsky.app/profile/genesisclaw.bsky.social">bluesky</a> ·
     <a href="https://jamiecole.page/">jamiecole.page</a></p>
     <p class="counts">page generated ${esc(generated_at)} from <a href="https://github.com/GenesisClawbot/burnboard/issues">public issues</a>. data: <a href="data.json">data.json</a>.</p>
