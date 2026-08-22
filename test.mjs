@@ -3,15 +3,23 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   claudeDedupeKey,
   createClaudeAggregator,
   aggregateCodex,
   parseCodexFile,
+  readCodex,
   parseSinceMs,
+  parseArgs,
   burnVerdict,
   combinedTotal,
+  renderText,
   buildSubmission,
   submissionIssueUrl,
   BOARD_REPO,
@@ -76,6 +84,28 @@ function codexUsage({ input = 0, cached = 0, cacheWrite = 0, output = 0, reasoni
     reasoning_output_tokens: reasoning,
     total_tokens: input + output,
   };
+}
+
+// A usage object with an independent total_tokens, for cases where the
+// per-event increment must differ from the cumulative difference.
+function rawUsage({ input = 0, cached = 0, cacheWrite = 0, output = 0, reasoning = 0, total = null } = {}) {
+  return {
+    input_tokens: input,
+    cached_input_tokens: cached,
+    cache_write_input_tokens: cacheWrite,
+    output_tokens: output,
+    reasoning_output_tokens: reasoning,
+    total_tokens: total ?? input + output,
+  };
+}
+
+// First-line session_meta for a Codex rollout file. parentId, when set, marks
+// the file as a fork/subagent that replays parent history.
+function codexMeta({ id, parentId = null, nested = null, timestamp = "2026-01-01T00:00:00.000Z" } = {}) {
+  const payload = { id, timestamp };
+  if (parentId !== null) payload.parent_thread_id = parentId;
+  if (nested !== null) payload.source = { subagent: { thread_spawn: { parent_thread_id: nested } } };
+  return JSON.stringify({ timestamp, type: "session_meta", payload });
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +356,190 @@ test("rate_limits with null info still records the window", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Codex: fork/subagent replay masking (the dominant reconciliation fix)
+// ---------------------------------------------------------------------------
+
+test("fork masking counts only the child's own events, not replayed parent history", () => {
+  // Parent P: three events. The first two land before the fork instant; the
+  // third lands after it and is not part of what the child replayed.
+  const parent = [
+    codexMeta({ id: "P", timestamp: "2026-01-01T00:00:00.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: codexUsage({ input: 90, output: 10 }), last: codexUsage({ input: 90, output: 10 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:10.000Z", total: codexUsage({ input: 270, output: 30 }), last: codexUsage({ input: 180, output: 20 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:00.000Z", total: codexUsage({ input: 720, output: 80 }), last: codexUsage({ input: 450, output: 50 }) }),
+  ].join("\n");
+  // Child C forks P at 00:00:30, between P's second and third events. It
+  // replays P's first two events verbatim, then runs its own two events.
+  const child = [
+    codexMeta({ id: "C", parentId: "P", timestamp: "2026-01-01T00:00:30.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:30.000Z", total: codexUsage({ input: 90, output: 10 }), last: codexUsage({ input: 90, output: 10 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:30.100Z", total: codexUsage({ input: 270, output: 30 }), last: codexUsage({ input: 180, output: 20 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:40.000Z", total: codexUsage({ input: 310, output: 40 }), last: codexUsage({ input: 40, output: 10 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:50.000Z", total: codexUsage({ input: 370, output: 50 }), last: codexUsage({ input: 60, output: 10 }) }),
+  ].join("\n");
+
+  const r = aggregateCodex([parent, child], { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  // Parent counts all three of its own events: total 100 + 200 + 500 = 800.
+  // Child counts only its own two: total 50 + 70 = 120. Replay is masked.
+  assert.equal(r.totals.total_tokens, 920);
+  assert.equal(r.totals.input_tokens, 90 + 180 + 450 + 40 + 60); // 820
+  assert.equal(r.totals.output_tokens, 10 + 20 + 50 + 10 + 10); // 100
+  assert.equal(r.sessions, 2);
+});
+
+test("fork masking resolves the parent by the nested subagent pointer too", () => {
+  const parent = [
+    codexMeta({ id: "P2", timestamp: "2026-01-01T00:00:00.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: codexUsage({ input: 100, output: 0 }), last: codexUsage({ input: 100, output: 0 }) }),
+  ].join("\n");
+  const child = [
+    codexMeta({ id: "C2", nested: "P2", timestamp: "2026-01-01T00:00:30.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:30.000Z", total: codexUsage({ input: 100, output: 0 }), last: codexUsage({ input: 100, output: 0 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:40.000Z", total: codexUsage({ input: 105, output: 0 }), last: codexUsage({ input: 5, output: 0 }) }),
+  ].join("\n");
+  const r = aggregateCodex([parent, child], { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  // Parent 100 + child's own 5. The child's replayed leading 100 is masked.
+  assert.equal(r.totals.total_tokens, 105);
+});
+
+// ---------------------------------------------------------------------------
+// Codex: per-event last_token_usage vs cumulative difference (Fix 3)
+// ---------------------------------------------------------------------------
+
+test("last_token_usage is preferred over the cumulative difference", () => {
+  // The cumulative jumps by 900 on the second event, but last_token_usage
+  // says the real increment is 300. ccusage counts last_token_usage.
+  const file = [
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: rawUsage({ input: 100, total: 100 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:00.000Z", total: rawUsage({ input: 1000, total: 1000 }), last: rawUsage({ input: 300, total: 300 }) }),
+  ].join("\n");
+  const r = aggregateCodex([file], { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  assert.equal(r.totals.total_tokens, 400); // 100 + 300, not 100 + 900
+  assert.equal(r.totals.input_tokens, 400);
+});
+
+test("cumulative difference is used when last_token_usage is absent", () => {
+  const file = [
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:00.000Z", total: rawUsage({ input: 1000, total: 1000 }) }),
+  ].join("\n");
+  const r = aggregateCodex([file], { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  assert.equal(r.totals.total_tokens, 1000); // 100 + (1000 - 100) diff
+  assert.equal(r.totals.input_tokens, 1000);
+});
+
+test("a cumulative reset counts last_token_usage", () => {
+  const file = [
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: rawUsage({ input: 1000, total: 1000 }), last: rawUsage({ input: 1000, total: 1000 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:00.000Z", total: rawUsage({ input: 100, total: 100 }), last: rawUsage({ input: 100, total: 100 }) }),
+  ].join("\n");
+  const r = aggregateCodex([file], { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  assert.equal(r.totals.total_tokens, 1100);
+  assert.equal(r.totals.input_tokens, 1100);
+});
+
+test("a stale repeat (counter did not advance) is not counted twice", () => {
+  // last_token_usage stays non-zero while the cumulative counter is flat.
+  // Counting last on the flat events would double the last real increment.
+  const file = [
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: rawUsage({ input: 100, total: 100 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:00.000Z", total: rawUsage({ input: 100, total: 100 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:02:00.000Z", total: rawUsage({ input: 100, total: 100 }), last: rawUsage({ input: 100, total: 100 }) }),
+  ].join("\n");
+  const r = aggregateCodex([file], { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  assert.equal(r.totals.total_tokens, 100);
+});
+
+// ---------------------------------------------------------------------------
+// Codex: burst fallback when the parent is unresolvable
+// ---------------------------------------------------------------------------
+
+test("burst fallback masks the leading dense burst when the parent is missing", () => {
+  // parent_thread_id points at a file not in the set. The leading three
+  // events are within 1000 ms of each other (replayed history); the real
+  // events start after a gap.
+  const child = [
+    codexMeta({ id: "C3", parentId: "GONE", timestamp: "2026-01-01T00:00:00.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: rawUsage({ input: 1000000, total: 1000000 }), last: rawUsage({ input: 1000000, total: 1000000 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:00.500Z", total: rawUsage({ input: 1000100, total: 1000100 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:00.700Z", total: rawUsage({ input: 1000200, total: 1000200 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:05.000Z", total: rawUsage({ input: 1000300, total: 1000300 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:06.000Z", total: rawUsage({ input: 1000400, total: 1000400 }), last: rawUsage({ input: 100, total: 100 }) }),
+  ].join("\n");
+  const r = aggregateCodex([child], { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  // First three events masked; only the last two (100 + 100) counted.
+  assert.equal(r.totals.total_tokens, 200);
+});
+
+test("burst fallback runs when a resolved parent has no matching prefix", () => {
+  // Some rewritten replay files name a real parent but do not preserve its
+  // per-event values. A zero-length parent match must not suppress the burst
+  // fallback, or the complete replay is counted as new usage.
+  const parent = [
+    codexMeta({ id: "P3", timestamp: "2026-01-01T00:00:00.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: rawUsage({ input: 7, total: 7 }), last: rawUsage({ input: 7, total: 7 }) }),
+  ].join("\n");
+  const child = [
+    codexMeta({ id: "C4", parentId: "P3", timestamp: "2026-01-01T00:01:00.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:01:00.000Z", total: rawUsage({ input: 1000000, total: 1000000 }), last: rawUsage({ input: 1000000, total: 1000000 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:00.500Z", total: rawUsage({ input: 1000100, total: 1000100 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:00.700Z", total: rawUsage({ input: 1000200, total: 1000200 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:05.000Z", total: rawUsage({ input: 1000300, total: 1000300 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:01:06.000Z", total: rawUsage({ input: 1000400, total: 1000400 }), last: rawUsage({ input: 100, total: 100 }) }),
+  ].join("\n");
+
+  const r = aggregateCodex([parent, child], { nowMs: Date.parse("2026-01-01T02:00:00.000Z") });
+  assert.equal(r.totals.total_tokens, 207);
+});
+
+test("burst fallback leaves a normal session untouched", () => {
+  // No parent pointer, events spaced well over 1000 ms apart: nothing masked.
+  const file = [
+    codexMeta({ id: "N", timestamp: "2026-01-01T00:00:00.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: rawUsage({ input: 100, total: 100 }), last: rawUsage({ input: 100, total: 100 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:10.000Z", total: rawUsage({ input: 300, total: 300 }), last: rawUsage({ input: 200, total: 200 }) }),
+  ].join("\n");
+  const r = aggregateCodex([file], { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  assert.equal(r.totals.total_tokens, 300);
+});
+
+// ---------------------------------------------------------------------------
+// Codex: archived_sessions second scan root, and cross-root parent resolution
+// ---------------------------------------------------------------------------
+
+test("readCodex scans the sibling archived_sessions root and resolves parents across roots", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "burnboard-codex-"));
+  const sessDir = path.join(tmp, ".codex", "sessions", "2026", "01", "01");
+  const archDir = path.join(tmp, ".codex", "archived_sessions");
+  fs.mkdirSync(sessDir, { recursive: true });
+  fs.mkdirSync(archDir, { recursive: true });
+
+  // Parent lives in archived_sessions; child (a fork) lives in sessions.
+  const parent = [
+    codexMeta({ id: "PA", timestamp: "2026-01-01T00:00:00.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:00.000Z", total: codexUsage({ input: 90, output: 10 }), last: codexUsage({ input: 90, output: 10 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:10.000Z", total: codexUsage({ input: 270, output: 30 }), last: codexUsage({ input: 180, output: 20 }) }),
+  ].join("\n");
+  const child = [
+    codexMeta({ id: "CA", parentId: "PA", timestamp: "2026-01-01T00:00:30.000Z" }),
+    codexLine({ timestamp: "2026-01-01T00:00:30.000Z", total: codexUsage({ input: 90, output: 10 }), last: codexUsage({ input: 90, output: 10 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:30.100Z", total: codexUsage({ input: 270, output: 30 }), last: codexUsage({ input: 180, output: 20 }) }),
+    codexLine({ timestamp: "2026-01-01T00:00:40.000Z", total: codexUsage({ input: 320, output: 40 }), last: codexUsage({ input: 50, output: 10 }) }),
+  ].join("\n");
+  fs.writeFileSync(path.join(archDir, "rollout-2026-01-01T00-00-00-PA.jsonl"), parent);
+  fs.writeFileSync(path.join(sessDir, "rollout-2026-01-01T00-00-30-CA.jsonl"), child);
+
+  const sessionsRoot = path.join(tmp, ".codex", "sessions");
+  const r = await readCodex(sessionsRoot, { nowMs: Date.parse("2026-01-01T01:00:00.000Z") });
+  assert.equal(r.files, 2); // both roots scanned
+  // Parent's own 300 (100 + 200) plus child's own 60. The child's replayed
+  // leading 300 is masked using the parent found in the other root.
+  assert.equal(r.totals.total_tokens, 360);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+// ---------------------------------------------------------------------------
 // Span tracking
 // ---------------------------------------------------------------------------
 
@@ -371,6 +585,13 @@ test("burnVerdict tiers are deterministic and cover the range", () => {
   assert.match(burnVerdict(500_000_000_000), /even I think/);
 });
 
+test("directory options reject missing and option-shaped values", () => {
+  for (const flag of ["--claude-dir", "--codex-dir"]) {
+    assert.deepEqual(parseArgs([flag]), { error: `${flag} requires a path` });
+    assert.deepEqual(parseArgs([flag, "--json"]), { error: `${flag} requires a path` });
+  }
+});
+
 function fixtureReport() {
   return {
     generated_at: "2026-08-19T21:00:00.000Z",
@@ -407,6 +628,49 @@ test("combinedTotal sums the four claude buckets plus the codex total", () => {
   assert.equal(combinedTotal(fixtureReport()), 100 + 200 + 300 + 400 + 70);
 });
 
+test("renderText shows reconciled Codex totals with subset labels", () => {
+  const text = renderText(fixtureReport());
+  assert.match(text, /codex\n  total tokens: 70/);
+  assert.match(text, /input: 50\n    cached input \(included above\): 10/);
+  assert.match(text, /output: 20\n    reasoning output \(included above\): 5/);
+  assert.match(text, /sessions: 2  files: 2/);
+  assert.doesNotMatch(text, /not counted in v0\.1/);
+});
+
+test("CLI JSON includes Codex totals from the configured directory", () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "burnboard-cli-"));
+  try {
+    const claudeDir = path.join(tmp, "claude");
+    const codexDir = path.join(tmp, ".codex", "sessions", "2026", "01", "01");
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.mkdirSync(codexDir, { recursive: true });
+    const rollout = [
+      codexMeta({ id: "CLI" }),
+      codexLine({
+        timestamp: "2026-01-01T00:00:02.000Z",
+        total: rawUsage({ input: 90, cached: 70, output: 10, reasoning: 4, total: 100 }),
+        last: rawUsage({ input: 90, cached: 70, output: 10, reasoning: 4, total: 100 }),
+      }),
+    ].join("\n");
+    fs.writeFileSync(path.join(codexDir, "rollout-cli.jsonl"), rollout);
+
+    const cli = fileURLToPath(new URL("./index.mjs", import.meta.url));
+    const run = spawnSync(process.execPath, [
+      cli,
+      "--json",
+      "--claude-dir", claudeDir,
+      "--codex-dir", path.join(tmp, ".codex", "sessions"),
+    ], { encoding: "utf8" });
+    assert.equal(run.status, 0, run.stderr);
+    const report = JSON.parse(run.stdout);
+    assert.equal(report.codex.totals.total_tokens, 100);
+    assert.equal(report.codex.totals.cached_input_tokens, 70);
+    assert.equal(report.codex.files, 1);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test("buildSubmission carries claude totals, span and counts, and no codex", () => {
   const sub = buildSubmission(fixtureReport());
   assert.equal(sub.burnboard, 1);
@@ -415,7 +679,7 @@ test("buildSubmission carries claude totals, span and counts, and no codex", () 
   assert.equal(sub.claude.entries, 5);
   assert.equal(sub.claude.first_ts, "2026-08-01T00:00:00.000Z");
   assert.equal(sub.claude.models, undefined);
-  // Codex failed its reconciliation gate; nothing of it may leave the machine.
+  // Codex is local-only until the board contract changes intentionally.
   assert.equal(sub.codex, undefined);
 });
 

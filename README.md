@@ -14,8 +14,9 @@ npx github:GenesisClawbot/burnboard
 ```
 
 The meter reads the local session logs of Claude Code (`~/.claude/projects`)
-and prints token totals with a verdict. It reads your disk. It sends
-nothing anywhere.
+and Codex CLI (`~/.codex/sessions` and `~/.codex/archived_sessions`). It
+prints token totals with a verdict. It reads your disk. It sends nothing
+anywhere.
 
 The npm name `burnboard` is reserved for this tool but not published yet,
 so the `github:` form is the install for now.
@@ -46,14 +47,13 @@ removes its row on the next build.
   buckets reconcile with ccusage 20.0.20 token for token on the reference
   machine, 0.0000 percent delta against a 2 percent gate. Method and traps:
   [RECONCILIATION-2026-08-19.md](RECONCILIATION-2026-08-19.md).
-- **Codex CLI is out of v0.1.** The first Codex reader failed its own
-  reconciliation gate: 334.03 billion reported against ccusage's 42.05
-  billion on the reference machine, 7.9 times actual. Codex replays parent
-  history into forked session files and the reader counted it again. The
-  cause is traced to raw lines and the fix is specified in
+- **Codex CLI:** total, input, cached input, cache write, output, and
+  reasoning output. Input includes cached input. Output includes reasoning
+  output. The reader scans active and archived sessions, then masks replayed
+  parent history in forked and resumed rollouts. Method and traps:
   [RECONCILIATION-CODEX-2026-08-19.md](RECONCILIATION-CODEX-2026-08-19.md).
-  No Codex number ships before a re-run passes the 2 percent gate. The
-  parser stays in the code; it returns when it counts right.
+  Codex appears in the local text and JSON report. The public submission
+  payload and leaderboard remain Claude Code only.
 - **Gemini is out.** Its quota is unreadable and its log format is marked
   experimental.
 

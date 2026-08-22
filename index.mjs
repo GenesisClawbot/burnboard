@@ -256,22 +256,93 @@ export async function readClaude(rootDir, { sinceMs = null } = {}) {
 // Codex reader
 // ---------------------------------------------------------------------------
 
+// Bucket mapping note (display, not the gate): input_tokens is
+// cache-inclusive. Through the ccusage mapping, ccusage inputTokens equals
+// (input_tokens minus cached_input_tokens), ccusage cacheReadTokens equals
+// cached_input_tokens, and output_tokens already includes
+// reasoning_output_tokens. Any display that prints input and cached input as
+// sibling rows must state that cached is a subset of input, or readers add
+// them. renderText makes that relationship explicit.
+
+/** True when every mapped token field of a usage object is zero or absent. */
+function allZeroUsage(u) {
+  if (u == null || typeof u !== "object") return true;
+  for (const f of CODEX_TOKEN_FIELDS) {
+    if (typeof u[f] === "number" && u[f] !== 0) return false;
+  }
+  return true;
+}
+
+/** Value-for-value equality across the mapped token fields (absent === 0). */
+function usageEqual(a, b) {
+  for (const f of CODEX_TOKEN_FIELDS) {
+    const av = typeof a?.[f] === "number" ? a[f] : 0;
+    const bv = typeof b?.[f] === "number" ? b[f] : 0;
+    if (av !== bv) return false;
+  }
+  return true;
+}
+
+/** Saturating per-field difference of two cumulative snapshots (prev may be null). */
+function saturatingDiff(cur, prev) {
+  const out = {};
+  for (const f of CODEX_TOKEN_FIELDS) {
+    const a = typeof cur?.[f] === "number" ? cur[f] : 0;
+    const b = typeof prev?.[f] === "number" ? prev[f] : 0;
+    out[f] = Math.max(0, a - b);
+  }
+  return out;
+}
+
 /**
- * Per-file parser for Codex rollout lines. Collects per-event usage deltas
- * and rate-limit window observations.
+ * Per-file parser for Codex rollout lines. Emits, per token_count event, the
+ * per-event usage increment ("eff") and whether the cumulative counter
+ * changed. It also reads the first-line session_meta to expose the session
+ * id and any parent pointer, which the aggregator uses to mask replayed
+ * parent history (forked and subagent files replay the parent's whole usage
+ * history as ordinary token_count events with rewritten timestamps).
  *
- * total_token_usage is cumulative within a session. The per-event delta is
- * the difference between consecutive cumulative snapshots. If the cumulative
- * counter goes backwards (session reset), fall back to last_token_usage,
- * then to the raw cumulative value.
+ * Per-event increment (mirrors ccusage): when the cumulative counter changed
+ * for an event, prefer payload.info.last_token_usage; fall back to the
+ * saturating cumulative difference only when last_token_usage is absent. On
+ * plain (non-forked) sessions this equals the old delta method exactly, and
+ * it composes with masking, which compares on the same per-event usage.
+ * Unchanged events (stale repeats) carry a real last_token_usage but are not
+ * counted; counting them would double the last real increment.
  *
  * Windows are keyed on window_minutes, never on primary/secondary position,
  * because the position semantics shift between Codex versions.
  */
 export function createCodexFileParser() {
-  const events = []; // { ts, delta }
+  const events = []; // { tsMs, eff, changed }
   const windows = new Map(); // window_minutes -> { ts, used_percent, resets_at }
-  let prev = null;
+  let prev = null; // previous cumulative snapshot
+  let id = null;
+  let parentId = null;
+  let metaTsMs = NaN;
+
+  function readMeta(entry) {
+    // Modern rollout: first line is {type:"session_meta", payload:{...}}.
+    if (entry?.type === "session_meta" && entry.payload && typeof entry.payload === "object") {
+      const p = entry.payload;
+      if (typeof p.id === "string") id = p.id;
+      const nested = p.source?.subagent?.thread_spawn?.parent_thread_id;
+      parentId =
+        (typeof p.parent_thread_id === "string" && p.parent_thread_id) ||
+        (typeof p.forked_from_id === "string" && p.forked_from_id) ||
+        (typeof nested === "string" && nested) ||
+        null;
+      const t = Date.parse(p.timestamp ?? "");
+      if (Number.isFinite(t)) metaTsMs = t;
+      return true;
+    }
+    // Legacy rollout (2025-09 shape): first line has a top-level id, no type.
+    if (id === null && entry && entry.type == null && typeof entry.id === "string") {
+      id = entry.id;
+      return true;
+    }
+    return false;
+  }
 
   function addLine(line) {
     const trimmed = line.trim();
@@ -282,30 +353,25 @@ export function createCodexFileParser() {
     } catch {
       return;
     }
+    if (id === null || parentId === null) {
+      if (readMeta(entry)) return;
+    }
     if (entry?.type !== "event_msg") return;
     const payload = entry.payload;
     if (payload?.type !== "token_count") return;
-    const ts = Date.parse(entry.timestamp ?? "");
+    const tsMs = Date.parse(entry.timestamp ?? "");
 
     const cur = payload.info?.total_token_usage;
     if (cur != null && typeof cur === "object" &&
         typeof cur.total_tokens === "number") {
-      let delta;
-      if (prev === null) {
-        delta = cur;
-      } else if (cur.total_tokens >= prev.total_tokens) {
-        delta = {};
-        for (const f of CODEX_TOKEN_FIELDS) {
-          const a = typeof cur[f] === "number" ? cur[f] : 0;
-          const b = typeof prev[f] === "number" ? prev[f] : 0;
-          delta[f] = Math.max(0, a - b);
-        }
-      } else {
-        // cumulative counter reset
-        delta = payload.info?.last_token_usage ?? cur;
-      }
+      const changed = prev === null || cur.total_tokens !== prev.total_tokens;
+      const last = payload.info?.last_token_usage;
+      const eff =
+        last != null && typeof last === "object" && !allZeroUsage(last)
+          ? last
+          : saturatingDiff(cur, prev);
       prev = cur;
-      events.push({ ts, delta });
+      events.push({ tsMs, eff, changed });
     }
 
     const rl = payload.rate_limits;
@@ -313,9 +379,9 @@ export function createCodexFileParser() {
       for (const w of [rl.primary, rl.secondary]) {
         if (w == null || typeof w.window_minutes !== "number") continue;
         const existing = windows.get(w.window_minutes);
-        if (existing === undefined || !(existing.ts >= ts)) {
+        if (existing === undefined || !(existing.ts >= tsMs)) {
           windows.set(w.window_minutes, {
-            ts,
+            ts: tsMs,
             used_percent: typeof w.used_percent === "number" ? w.used_percent : null,
             resets_at: typeof w.resets_at === "number" ? w.resets_at : null,
           });
@@ -325,7 +391,7 @@ export function createCodexFileParser() {
   }
 
   function result() {
-    return { events, windows };
+    return { id, parentId, metaTsMs, events, windows };
   }
 
   return { addLine, result };
@@ -339,29 +405,95 @@ export function parseCodexFile(text) {
 }
 
 /**
- * Aggregate parsed Codex files.
- * - totals: sum of per-event deltas that pass the since filter.
- * - windows: keyed by window_minutes; latest used_percent by timestamp, plus
- *   tokens_in_window, the sum of event deltas inside the trailing window.
+ * Number of leading child events that replay the parent's pre-fork usage.
+ * The parent's token_count events are chronological; walk both in lockstep,
+ * masking each child event whose per-event usage matches the parent's next
+ * pre-fork event value-for-value. Stop at the first mismatch, or once the
+ * parent's events pass the fork timestamp. Lazy: a non-replaying child stops
+ * after one comparison.
  */
-export function finalizeCodex(parsedFiles, { sinceMs = null, nowMs = Date.now() } = {}) {
+function matchParentPrefix(childEvents, parentEvents, forkTs) {
+  let m = 0;
+  let pi = 0;
+  while (m < childEvents.length && pi < parentEvents.length) {
+    const pev = parentEvents[pi];
+    if (Number.isFinite(forkTs) && Number.isFinite(pev.tsMs) && pev.tsMs > forkTs) break;
+    if (!usageEqual(childEvents[m].eff, pev.eff)) break;
+    m += 1;
+    pi += 1;
+  }
+  return m;
+}
+
+/**
+ * Burst fallback for files with no resolvable parent (ccusage's heuristic for
+ * resume-replay files, which reopen an already-loaded counter and dump the
+ * replayed history as a dense leading burst). Mask the leading run of events
+ * separated by 1000 ms or less between consecutive events.
+ */
+function burstMaskCount(events) {
+  let m = 0;
+  while (m + 1 < events.length) {
+    const gap = events[m + 1].tsMs - events[m].tsMs;
+    if (Number.isFinite(gap) && gap <= 1000) m += 1;
+    else break;
+  }
+  return m > 0 ? m + 1 : 0;
+}
+
+/** Leading events to skip for one file: parent-replay masking, else burst. */
+function maskCountFor(parsed, index, burstFallback) {
+  if (parsed.events.length === 0) return 0;
+  if (parsed.parentId) {
+    const parent = index.get(parsed.parentId);
+    if (parent && parent !== parsed) {
+      const forkTs = Number.isFinite(parsed.metaTsMs)
+        ? parsed.metaTsMs
+        : parsed.events[0].tsMs;
+      const parentPrefix = matchParentPrefix(parsed.events, parent.events, forkTs);
+      if (parentPrefix > 0) return parentPrefix;
+    }
+  }
+  return burstFallback ? burstMaskCount(parsed.events) : 0;
+}
+
+/**
+ * Aggregate parsed Codex files with fork/subagent replay masking.
+ * - Build a session index (id -> parsed file) so children resolve parents.
+ * - totals: sum of unmasked, changed, non-zero per-event increments that
+ *   pass the since filter.
+ * - windows: keyed by window_minutes; latest used_percent by timestamp, plus
+ *   tokens_in_window, the sum of counted increments inside the trailing
+ *   window (masked replay events never reach it).
+ */
+export function finalizeCodex(parsedFiles, { sinceMs = null, nowMs = Date.now(), burstFallback = true } = {}) {
+  const index = new Map();
+  for (const p of parsedFiles) {
+    if (typeof p.id === "string" && p.id.length > 0 && !index.has(p.id)) index.set(p.id, p);
+  }
+
   const totals = zeroTotals(CODEX_TOKEN_FIELDS);
-  const allEvents = [];
+  const countedEvents = []; // { tsMs, incTotal } for window sums
   const windows = new Map();
   let sessions = 0;
   let firstTs = Infinity;
   let lastTs = -Infinity;
 
   for (const parsed of parsedFiles) {
+    const mask = maskCountFor(parsed, index, burstFallback);
     let counted = 0;
-    for (const ev of parsed.events) {
-      if (sinceMs !== null && !(Number.isFinite(ev.ts) && ev.ts >= sinceMs)) continue;
-      addTotals(totals, ev.delta, CODEX_TOKEN_FIELDS);
-      allEvents.push(ev);
+    for (let i = mask; i < parsed.events.length; i += 1) {
+      const ev = parsed.events[i];
+      if (!ev.changed) continue; // stale repeat: counter did not change
+      if (allZeroUsage(ev.eff)) continue;
+      if (sinceMs !== null && !(Number.isFinite(ev.tsMs) && ev.tsMs >= sinceMs)) continue;
+      addTotals(totals, ev.eff, CODEX_TOKEN_FIELDS);
+      const incTotal = typeof ev.eff.total_tokens === "number" ? ev.eff.total_tokens : 0;
+      countedEvents.push({ tsMs: ev.tsMs, incTotal });
       counted += 1;
-      if (Number.isFinite(ev.ts)) {
-        if (ev.ts < firstTs) firstTs = ev.ts;
-        if (ev.ts > lastTs) lastTs = ev.ts;
+      if (Number.isFinite(ev.tsMs)) {
+        if (ev.tsMs < firstTs) firstTs = ev.tsMs;
+        if (ev.tsMs > lastTs) lastTs = ev.tsMs;
       }
     }
     if (counted > 0) sessions += 1;
@@ -376,11 +508,8 @@ export function finalizeCodex(parsedFiles, { sinceMs = null, nowMs = Date.now() 
     const obs = windows.get(minutes);
     const cutoff = nowMs - minutes * 60_000;
     let tokensInWindow = 0;
-    for (const ev of allEvents) {
-      if (Number.isFinite(ev.ts) && ev.ts >= cutoff) {
-        const v = ev.delta.total_tokens;
-        if (typeof v === "number" && Number.isFinite(v)) tokensInWindow += v;
-      }
+    for (const ev of countedEvents) {
+      if (Number.isFinite(ev.tsMs) && ev.tsMs >= cutoff) tokensInWindow += ev.incTotal;
     }
     windowsOut[minutes] = {
       window_minutes: minutes,
@@ -404,18 +533,34 @@ export function aggregateCodex(fileTexts, opts = {}) {
   return finalizeCodex(fileTexts.map(parseCodexFile), opts);
 }
 
-export async function readCodex(rootDir, { sinceMs = null, nowMs = Date.now() } = {}) {
-  const files = walkFiles(
-    rootDir,
-    (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
-  );
+/**
+ * Default scan roots for Codex: the given sessions dir plus its sibling
+ * archived_sessions, which ccusage also reads. The session index and totals
+ * span both. Duplicate or missing roots are dropped (walkFiles tolerates a
+ * missing directory).
+ */
+export function codexRoots(codexDir) {
+  const roots = [codexDir];
+  const archived = path.join(path.dirname(codexDir), "archived_sessions");
+  if (archived !== codexDir) roots.push(archived);
+  return [...new Set(roots)];
+}
+
+export async function readCodex(codexDir, { sinceMs = null, nowMs = Date.now(), roots = null, burstFallback = true } = {}) {
+  const scanRoots = roots ?? codexRoots(codexDir);
+  const files = [];
+  for (const root of scanRoots) {
+    for (const f of walkFiles(root, (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"))) {
+      files.push(f);
+    }
+  }
   const parsedFiles = [];
   for (const file of files) {
     const parser = createCodexFileParser();
     await eachLine(file, parser.addLine);
     parsedFiles.push(parser.result());
   }
-  return { files: files.length, ...finalizeCodex(parsedFiles, { sinceMs, nowMs }) };
+  return { files: files.length, ...finalizeCodex(parsedFiles, { sinceMs, nowMs, burstFallback }) };
 }
 
 // ---------------------------------------------------------------------------
@@ -506,11 +651,18 @@ export function renderText(report) {
   lines.push("");
 
   lines.push("codex");
-  lines.push("  not counted in v0.1. the first codex reader failed reconciliation");
-  lines.push("  against ccusage by a factor of 7.9: codex replays parent history");
-  lines.push("  into forked session files and the reader counted it again. the");
-  lines.push("  cause is traced and the fix is specified in RECONCILIATION-CODEX.");
-  lines.push("  no number ships before it reconciles.");
+  const x = report.codex;
+  if (x == null || x.sessions === 0) {
+    lines.push("  no usage entries found");
+  } else {
+    lines.push(`  total tokens: ${fmt(x.totals.total_tokens)}`);
+    lines.push(`  input: ${fmt(x.totals.input_tokens)}`);
+    lines.push(`    cached input (included above): ${fmt(x.totals.cached_input_tokens)}`);
+    lines.push(`  cache write: ${fmt(x.totals.cache_write_input_tokens)}`);
+    lines.push(`  output: ${fmt(x.totals.output_tokens)}`);
+    lines.push(`    reasoning output (included above): ${fmt(x.totals.reasoning_output_tokens)}`);
+    lines.push(`  sessions: ${fmt(x.sessions)}  files: ${fmt(x.files)}`);
+  }
   lines.push("");
   lines.push("tokens only; this machine only");
   return lines.join("\n");
@@ -522,7 +674,7 @@ export function renderText(report) {
 
 export const BOARD_REPO = "GenesisClawbot/burnboard";
 
-const USAGE = `usage: burnboard [submit] [--json] [--since YYYY-MM-DD] [--claude-dir <path>]
+const USAGE = `usage: burnboard [submit] [--json] [--since YYYY-MM-DD] [--claude-dir <path>] [--codex-dir <path>]
 
   (no command)  print token usage on this machine
   submit        print usage, then open a prefilled GitHub issue for the
@@ -543,8 +695,15 @@ export function parseArgs(argv) {
     else if (arg === "--json") opts.json = true;
     else if (arg === "--since") opts.since = argv[++i];
     else if (arg.startsWith("--since=")) opts.since = arg.slice("--since=".length);
-    else if (arg === "--claude-dir") opts.claudeDir = argv[++i];
-    else if (arg === "--codex-dir") opts.codexDir = argv[++i];
+    else if (arg === "--claude-dir" || arg === "--codex-dir") {
+      const value = argv[i + 1];
+      if (value === undefined || value === "" || value.startsWith("-")) {
+        return { error: `${arg} requires a path` };
+      }
+      i += 1;
+      if (arg === "--claude-dir") opts.claudeDir = value;
+      else opts.codexDir = value;
+    }
     else if (arg === "--help" || arg === "-h") return { help: true };
     else return { error: `unknown argument: ${arg}` };
   }
@@ -560,8 +719,8 @@ export function parseArgs(argv) {
 
 /**
  * The exact numbers that go on the board. Nothing else leaves the machine.
- * Claude only: the Codex reader failed its reconciliation gate and no
- * Codex number ships before it passes. See RECONCILIATION-CODEX-2026-08-19.md.
+ * Claude only by the current board contract. The local report includes
+ * Codex, but public ranking and visible columns remain Claude-based.
  */
 export function buildSubmission(report) {
   const c = report.claude;
@@ -667,13 +826,11 @@ async function main() {
     return;
   }
   const { opts } = parsed;
-  // Codex is not read in v0.1: the reader failed its reconciliation gate
-  // (7.9x over on the reference machine, fork-replay re-counting). The
-  // parser stays in this file; it returns when a re-run passes the gate.
   const report = {
     generated_at: new Date().toISOString(),
     since: opts.since,
     claude: await readClaude(opts.claudeDir, { sinceMs: opts.sinceMs }),
+    codex: await readCodex(opts.codexDir, { sinceMs: opts.sinceMs }),
   };
   if (opts.submit) await runSubmit(report);
   else if (opts.json) console.log(JSON.stringify(report, null, 2));
