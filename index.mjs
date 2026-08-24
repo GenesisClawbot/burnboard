@@ -674,21 +674,17 @@ export function renderText(report) {
 
 export const BOARD_REPO = "GenesisClawbot/burnboard";
 
-const USAGE = `usage: burnboard [submit|share] [--json] [--since YYYY-MM-DD] [--claude-dir <path>] [--codex-dir <path>]
+const USAGE = `usage: burnboard [submit] [--json] [--since YYYY-MM-DD] [--claude-dir <path>] [--codex-dir <path>]
 
   (no command)  print token usage on this machine
   submit        print usage, then open a prefilled GitHub issue for the
                 public leaderboard. Nothing is sent without your consent;
-                the issue is opened by you, in your browser, on your account.
-  share         preview a short post with your combined local token total,
-                then open Bluesky compose after consent. Burnboard never posts.
-                Share always uses the full total; --since is not accepted.`;
+                the issue is opened by you, in your browser, on your account.`;
 
 export function parseArgs(argv) {
   const opts = {
     json: false,
     submit: false,
-    share: false,
     since: null,
     claudeDir: path.join(os.homedir(), ".claude", "projects"),
     codexDir: path.join(os.homedir(), ".codex", "sessions"),
@@ -696,7 +692,6 @@ export function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "submit") opts.submit = true;
-    else if (arg === "share") opts.share = true;
     else if (arg === "--json") opts.json = true;
     else if (arg === "--since") opts.since = argv[++i];
     else if (arg.startsWith("--since=")) opts.since = arg.slice("--since=".length);
@@ -712,18 +707,12 @@ export function parseArgs(argv) {
     else if (arg === "--help" || arg === "-h") return { help: true };
     else return { error: `unknown argument: ${arg}` };
   }
-  if (opts.submit && opts.share) {
-    return { error: "choose one command: submit or share" };
-  }
   if (opts.since !== null) {
     const ms = parseSinceMs(opts.since);
     if (ms === null) return { error: `--since must be YYYY-MM-DD, got: ${opts.since}` };
     opts.sinceMs = ms;
   } else {
     opts.sinceMs = null;
-  }
-  if (opts.share && opts.since !== null) {
-    return { error: "share always reports the full local total; remove --since" };
   }
   return { opts };
 }
@@ -772,21 +761,6 @@ export function submissionIssueUrl(submission) {
   );
 }
 
-export function buildShareText(report) {
-  const total = combinedTotal(report);
-  return [
-    `my coding agents ate ${fmt(total)} tokens on this machine.`,
-    "",
-    burnVerdict(total),
-    "",
-    "see the damage: https://jamiecole.page/burnboard/",
-  ].join("\n");
-}
-
-export function shareIntentUrl(text) {
-  return `https://bsky.app/intent/compose?text=${encodeURIComponent(text)}`;
-}
-
 function openInBrowser(url) {
   const cmd =
     process.platform === "darwin" ? ["open", [url]]
@@ -807,42 +781,6 @@ async function askYesNo(question) {
   const answer = await new Promise((resolve) => rl.question(question, resolve));
   rl.close();
   return /^y(es)?$/i.test(answer.trim());
-}
-
-export async function runShare(report, {
-  isTTY = process.stdin.isTTY,
-  write = console.log,
-  askConsent = askYesNo,
-  openBrowser = openInBrowser,
-} = {}) {
-  const text = buildShareText(report);
-  const url = shareIntentUrl(text);
-  write(renderText(report));
-  write();
-  write("this exact text goes into Bluesky's compose screen:");
-  write();
-  write(text);
-  write();
-  if (!isTTY) {
-    write("no terminal to ask consent in, so nothing was opened.");
-    write("open this URL yourself to share:");
-    write(url);
-    return;
-  }
-  const yes = await askConsent(
-    "open Bluesky compose? the exact draft above leaves this machine. [y/N] ",
-  );
-  if (!yes) {
-    write("nothing opened. keep the fire private.");
-    return;
-  }
-  const opened = await openBrowser(url);
-  if (opened) {
-    write("Bluesky launch requested. Edit the draft, then press post yourself.");
-  } else {
-    write("could not request a browser launch. open this URL yourself:");
-  }
-  write(url);
 }
 
 async function runSubmit(report) {
@@ -895,7 +833,6 @@ async function main() {
     codex: await readCodex(opts.codexDir, { sinceMs: opts.sinceMs }),
   };
   if (opts.submit) await runSubmit(report);
-  else if (opts.share) await runShare(report);
   else if (opts.json) console.log(JSON.stringify(report, null, 2));
   else console.log(renderText(report));
 }

@@ -38,19 +38,6 @@ Three steps, consent in the middle:
 A scheduled job rebuilds the board from open issues. Closing an issue
 removes its row on the next build.
 
-## Share the damage
-
-```
-npx github:GenesisClawbot/burnboard share
-```
-
-Burnboard shows the exact post first. After you agree, it opens Bluesky's
-compose screen. You edit it and press post yourself. Burnboard never posts.
-
-The draft contains your combined local token total, a verdict derived from
-that total, and the public board URL. It contains no model names, file paths,
-session dates, or account data.
-
 ## What it counts, exactly
 
 - **Tokens only. No dollar figures.** Cost tables drift and I will not

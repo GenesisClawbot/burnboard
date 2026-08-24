@@ -22,9 +22,6 @@ import {
   renderText,
   buildSubmission,
   submissionIssueUrl,
-  buildShareText,
-  shareIntentUrl,
-  runShare,
   BOARD_REPO,
 } from "./index.mjs";
 
@@ -693,88 +690,4 @@ test("submissionIssueUrl targets the board repo with title and body", () => {
   assert.equal(params.get("title"), "submission: 1,000 claude tokens");
   assert.match(params.get("body"), /"burnboard": 1/);
   assert.match(params.get("body"), /consent/);
-});
-
-test("share is a first-class command and cannot run beside submit", () => {
-  const parsed = parseArgs(["share"]);
-  assert.equal(parsed.opts.share, true);
-  assert.equal(parsed.opts.submit, false);
-  assert.deepEqual(parseArgs(["share", "submit"]), {
-    error: "choose one command: submit or share",
-  });
-});
-
-test("share rejects a since filter rather than publishing an unqualified slice", () => {
-  assert.deepEqual(parseArgs(["share", "--since", "2026-08-24"]), {
-    error: "share always reports the full local total; remove --since",
-  });
-});
-
-test("buildShareText exposes only the combined total and public board URL", () => {
-  assert.equal(
-    buildShareText(fixtureReport()),
-    "my coding agents ate 1,070 tokens on this machine.\n\n" +
-      "under a million. a match, not a fire.\n\n" +
-      "see the damage: https://jamiecole.page/burnboard/",
-  );
-});
-
-test("shareIntentUrl puts the exact preview into Bluesky compose", () => {
-  const text = buildShareText(fixtureReport());
-  const url = new URL(shareIntentUrl(text));
-
-  assert.equal(url.origin, "https://bsky.app");
-  assert.equal(url.pathname, "/intent/compose");
-  assert.equal(url.searchParams.get("text"), text);
-});
-
-test("runShare opens nothing when there is no terminal for consent", async () => {
-  const lines = [];
-  let opened = false;
-
-  await runShare(fixtureReport(), {
-    isTTY: false,
-    write: (line = "") => lines.push(line),
-    openBrowser: async () => {
-      opened = true;
-      return true;
-    },
-  });
-
-  const output = lines.join("\n");
-  assert.equal(opened, false);
-  assert.match(output, /this exact text goes into Bluesky's compose screen/i);
-  assert.match(output, /no terminal to ask consent in, so nothing was opened/i);
-  assert.match(output, /https:\/\/bsky\.app\/intent\/compose\?text=/);
-});
-
-test("interactive share discloses the exact draft before asking consent", async () => {
-  let question;
-
-  await runShare(fixtureReport(), {
-    isTTY: true,
-    write: () => {},
-    askConsent: async (value) => {
-      question = value;
-      return false;
-    },
-  });
-
-  assert.match(question, /the exact draft above leaves this machine/i);
-});
-
-test("accepted share prints the compose URL even after requesting launch", async () => {
-  const lines = [];
-
-  await runShare(fixtureReport(), {
-    isTTY: true,
-    write: (line = "") => lines.push(line),
-    askConsent: async () => true,
-    openBrowser: async () => true,
-  });
-
-  const output = lines.join("\n");
-  assert.match(output, /Bluesky launch requested/i);
-  assert.match(output, /https:\/\/bsky\.app\/intent\/compose\?text=/);
-  assert.doesNotMatch(output, /Bluesky compose opened/i);
 });
